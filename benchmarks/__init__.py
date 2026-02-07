@@ -1,0 +1,1 @@
+"""BoltEmbedding benchmarks."""
