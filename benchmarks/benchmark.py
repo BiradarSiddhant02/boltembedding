@@ -22,11 +22,21 @@ Usage:
 """
 
 import argparse
+import os
+import tempfile
 import time
 import sys
+from enum import Enum, auto
 from typing import Callable, Dict, List, Tuple
 
 import numpy as np
+
+
+class MemoryMode(Enum):
+    """Memory modes for BoltEmbedding initialization."""
+
+    IN_MEMORY = auto()  # Pass embeddings directly as numpy array
+    FILE_BASED = auto()  # Load embeddings from .npy file
 
 # Check for optional dependencies
 try:
@@ -134,22 +144,60 @@ class BenchmarkRunner:
         self.queries = np.random.randn(batch_size, embedding_dim).astype(np.float32)
         self.single_query = self.queries[0]
 
+        # Temp file for file-based mode
+        self._temp_file = None
+        self._temp_path = None
+
         # Will hold initialized libraries
-        self._bolt = None
+        self._bolt_inmemory = None
+        self._bolt_filebased = None
         self._faiss_index = None
         self._sklearn_nn = None
 
-    def setup_boltembedding(self) -> float:
+    def _ensure_temp_file(self) -> str:
+        """Create temp file with embeddings if not already created."""
+        if self._temp_path is None:
+            self._temp_file = tempfile.NamedTemporaryFile(
+                suffix=".npy", delete=False
+            )
+            self._temp_path = self._temp_file.name
+            self._temp_file.close()
+            np.save(self._temp_path, self.embeddings)
+        return self._temp_path
+
+    def cleanup(self):
+        """Clean up temporary files."""
+        if self._temp_path is not None and os.path.exists(self._temp_path):
+            os.unlink(self._temp_path)
+            self._temp_path = None
+            self._temp_file = None
+
+    def setup_boltembedding(
+        self, memory_mode: MemoryMode = MemoryMode.IN_MEMORY
+    ) -> float:
         """Setup BoltEmbedding and return setup time in ns."""
         start = time.perf_counter_ns()
-        self._bolt = BoltEmbedding(
-            embeddings=self.embeddings,
-            metric=DistanceMetric.EUCLIDEAN,
-            device=Device.CPU,
-        )
-        self._bolt.index(k=self.k)
-        # Warmup JIT
-        _ = self._bolt.query(self.single_query)
+
+        if memory_mode == MemoryMode.IN_MEMORY:
+            self._bolt_inmemory = BoltEmbedding(
+                embeddings=self.embeddings,
+                metric=DistanceMetric.EUCLIDEAN,
+                device=Device.CPU,
+            )
+            self._bolt_inmemory.index(k=self.k)
+            # Warmup JIT
+            _ = self._bolt_inmemory.query(self.single_query)
+        else:  # FILE_BASED
+            path = self._ensure_temp_file()
+            self._bolt_filebased = BoltEmbedding(
+                path=path,
+                metric=DistanceMetric.EUCLIDEAN,
+                device=Device.CPU,
+            )
+            self._bolt_filebased.index(k=self.k)
+            # Warmup JIT
+            _ = self._bolt_filebased.query(self.single_query)
+
         end = time.perf_counter_ns()
         return end - start
 
@@ -176,22 +224,36 @@ class BenchmarkRunner:
         return end - start
 
     def benchmark_boltembedding_single(
-        self, n_warmup: int, n_iterations: int
+        self, n_warmup: int, n_iterations: int, memory_mode: MemoryMode = MemoryMode.IN_MEMORY
     ) -> Tuple[float, float]:
         """Benchmark BoltEmbedding single query."""
+        bolt = (
+            self._bolt_inmemory
+            if memory_mode == MemoryMode.IN_MEMORY
+            else self._bolt_filebased
+        )
+        if bolt is None:
+            return 0, 0
 
         def query_fn():
-            return self._bolt.query(self.single_query)
+            return bolt.query(self.single_query)
 
         return benchmark_function(query_fn, n_warmup, n_iterations)
 
     def benchmark_boltembedding_batch(
-        self, n_warmup: int, n_iterations: int
+        self, n_warmup: int, n_iterations: int, memory_mode: MemoryMode = MemoryMode.IN_MEMORY
     ) -> Tuple[float, float]:
         """Benchmark BoltEmbedding batch query."""
+        bolt = (
+            self._bolt_inmemory
+            if memory_mode == MemoryMode.IN_MEMORY
+            else self._bolt_filebased
+        )
+        if bolt is None:
+            return 0, 0
 
         def query_fn():
-            return self._bolt.query(self.queries)
+            return bolt.query(self.queries)
 
         return benchmark_function(query_fn, n_warmup, n_iterations)
 
@@ -261,6 +323,7 @@ def run_benchmark(
     n_warmup: int = 10,
     n_iterations: int = 100,
     verbose: bool = True,
+    benchmark_memory_modes: bool = True,
 ) -> Dict:
     """Run complete benchmark suite for a configuration."""
 
@@ -288,40 +351,62 @@ def run_benchmark(
     if verbose:
         print("\n--- Setup Time ---")
 
-    bolt_setup = runner.setup_boltembedding()
-    results["setup"]["boltembedding"] = bolt_setup
+    # BoltEmbedding in-memory mode
+    bolt_setup_inmemory = runner.setup_boltembedding(MemoryMode.IN_MEMORY)
+    results["setup"]["boltembedding_inmemory"] = bolt_setup_inmemory
     if verbose:
-        print(f"BoltEmbedding: {format_time(bolt_setup)}")
+        print(f"Bolt (in-memory):  {format_time(bolt_setup_inmemory)}")
+
+    # BoltEmbedding file-based mode
+    if benchmark_memory_modes:
+        bolt_setup_filebased = runner.setup_boltembedding(MemoryMode.FILE_BASED)
+        results["setup"]["boltembedding_filebased"] = bolt_setup_filebased
+        if verbose:
+            print(f"Bolt (file-based): {format_time(bolt_setup_filebased)}")
 
     if HAS_FAISS:
         faiss_setup = runner.setup_faiss()
         results["setup"]["faiss"] = faiss_setup
         if verbose:
-            print(f"FAISS:         {format_time(faiss_setup)}")
+            print(f"FAISS:             {format_time(faiss_setup)}")
 
     if HAS_SKLEARN:
         sklearn_setup = runner.setup_sklearn()
         results["setup"]["sklearn"] = sklearn_setup
         if verbose:
-            print(f"scikit-learn:  {format_time(sklearn_setup)}")
+            print(f"scikit-learn:      {format_time(sklearn_setup)}")
 
     # Single query benchmarks
     if verbose:
         print("\n--- Single Query Latency ---")
 
-    bolt_single = runner.benchmark_boltembedding_single(n_warmup, n_iterations)
-    results["single_query"]["boltembedding"] = bolt_single
+    # In-memory mode
+    bolt_single_inmemory = runner.benchmark_boltembedding_single(
+        n_warmup, n_iterations, MemoryMode.IN_MEMORY
+    )
+    results["single_query"]["boltembedding_inmemory"] = bolt_single_inmemory
     if verbose:
         print(
-            f"BoltEmbedding: {format_time(bolt_single[0])} ± {format_time(bolt_single[1])}"
+            f"Bolt (in-memory):  {format_time(bolt_single_inmemory[0])} ± {format_time(bolt_single_inmemory[1])}"
         )
+
+    # File-based mode
+    if benchmark_memory_modes:
+        bolt_single_filebased = runner.benchmark_boltembedding_single(
+            n_warmup, n_iterations, MemoryMode.FILE_BASED
+        )
+        results["single_query"]["boltembedding_filebased"] = bolt_single_filebased
+        if verbose:
+            print(
+                f"Bolt (file-based): {format_time(bolt_single_filebased[0])} ± {format_time(bolt_single_filebased[1])}"
+            )
 
     if HAS_FAISS:
         faiss_single = runner.benchmark_faiss_single(n_warmup, n_iterations)
         results["single_query"]["faiss"] = faiss_single
         if verbose:
             print(
-                f"FAISS:         {format_time(faiss_single[0])} ± {format_time(faiss_single[1])}"
+                f"FAISS:             {format_time(faiss_single[0])} ± {format_time(faiss_single[1])}"
             )
 
     if HAS_SKLEARN:
@@ -329,20 +414,35 @@ def run_benchmark(
         results["single_query"]["sklearn"] = sklearn_single
         if verbose:
             print(
-                f"scikit-learn:  {format_time(sklearn_single[0])} ± {format_time(sklearn_single[1])}"
+                f"scikit-learn:      {format_time(sklearn_single[0])} ± {format_time(sklearn_single[1])}"
             )
 
     # Batch query benchmarks
     if verbose:
         print(f"\n--- Batch Query Latency (batch_size={batch_size}) ---")
 
-    bolt_batch = runner.benchmark_boltembedding_batch(n_warmup, n_iterations)
-    results["batch_query"]["boltembedding"] = bolt_batch
+    # In-memory mode
+    bolt_batch_inmemory = runner.benchmark_boltembedding_batch(
+        n_warmup, n_iterations, MemoryMode.IN_MEMORY
+    )
+    results["batch_query"]["boltembedding_inmemory"] = bolt_batch_inmemory
     if verbose:
-        per_query = bolt_batch[0] / batch_size
+        per_query = bolt_batch_inmemory[0] / batch_size
         print(
-            f"BoltEmbedding: {format_time(bolt_batch[0])} total, {format_time(per_query)}/query"
+            f"Bolt (in-memory):  {format_time(bolt_batch_inmemory[0])} total, {format_time(per_query)}/query"
         )
+
+    # File-based mode
+    if benchmark_memory_modes:
+        bolt_batch_filebased = runner.benchmark_boltembedding_batch(
+            n_warmup, n_iterations, MemoryMode.FILE_BASED
+        )
+        results["batch_query"]["boltembedding_filebased"] = bolt_batch_filebased
+        if verbose:
+            per_query = bolt_batch_filebased[0] / batch_size
+            print(
+                f"Bolt (file-based): {format_time(bolt_batch_filebased[0])} total, {format_time(per_query)}/query"
+            )
 
     if HAS_FAISS:
         faiss_batch = runner.benchmark_faiss_batch(n_warmup, n_iterations)
@@ -350,7 +450,7 @@ def run_benchmark(
         if verbose:
             per_query = faiss_batch[0] / batch_size
             print(
-                f"FAISS:         {format_time(faiss_batch[0])} total, {format_time(per_query)}/query"
+                f"FAISS:             {format_time(faiss_batch[0])} total, {format_time(per_query)}/query"
             )
 
     if HAS_SKLEARN:
@@ -359,27 +459,40 @@ def run_benchmark(
         if verbose:
             per_query = sklearn_batch[0] / batch_size
             print(
-                f"scikit-learn:  {format_time(sklearn_batch[0])} total, {format_time(per_query)}/query"
+                f"scikit-learn:      {format_time(sklearn_batch[0])} total, {format_time(per_query)}/query"
             )
 
     # Speedup summary
     if verbose and HAS_FAISS:
-        print("\n--- Speedup vs FAISS ---")
-        if faiss_single[0] > 0:
-            speedup_single = faiss_single[0] / bolt_single[0]
+        print("\n--- Speedup vs FAISS (in-memory) ---")
+        if faiss_single[0] > 0 and bolt_single_inmemory[0] > 0:
+            speedup_single = faiss_single[0] / bolt_single_inmemory[0]
             print(
                 f"Single query: {speedup_single:.2f}x {'faster' if speedup_single > 1 else 'slower'}"
             )
-        if faiss_batch[0] > 0:
-            speedup_batch = faiss_batch[0] / bolt_batch[0]
+        if faiss_batch[0] > 0 and bolt_batch_inmemory[0] > 0:
+            speedup_batch = faiss_batch[0] / bolt_batch_inmemory[0]
             print(
                 f"Batch query:  {speedup_batch:.2f}x {'faster' if speedup_batch > 1 else 'slower'}"
             )
 
+    # Memory mode comparison
+    if verbose and benchmark_memory_modes:
+        print("\n--- Memory Mode Comparison ---")
+        if bolt_single_inmemory[0] > 0 and bolt_single_filebased[0] > 0:
+            ratio = bolt_single_filebased[0] / bolt_single_inmemory[0]
+            print(f"Single query: file-based is {ratio:.2f}x {'slower' if ratio > 1 else 'faster'} than in-memory")
+        if bolt_batch_inmemory[0] > 0 and bolt_batch_filebased[0] > 0:
+            ratio = bolt_batch_filebased[0] / bolt_batch_inmemory[0]
+            print(f"Batch query:  file-based is {ratio:.2f}x {'slower' if ratio > 1 else 'faster'} than in-memory")
+
+    # Cleanup
+    runner.cleanup()
+
     return results
 
 
-def run_full_benchmark_suite(config: Dict = None, verbose: bool = True) -> List[Dict]:
+def run_full_benchmark_suite(config: Dict = None, verbose: bool = True, benchmark_memory_modes: bool = True) -> List[Dict]:
     """Run complete benchmark suite with multiple configurations."""
     if config is None:
         config = DEFAULT_CONFIG
@@ -393,6 +506,7 @@ def run_full_benchmark_suite(config: Dict = None, verbose: bool = True) -> List[
     print(f"  - BoltEmbedding: ✓")
     print(f"  - FAISS: {'✓' if HAS_FAISS else '✗ (not installed)'}")
     print(f"  - scikit-learn: {'✓' if HAS_SKLEARN else '✗ (not installed)'}")
+    print(f"\nMemory modes: {'in-memory + file-based' if benchmark_memory_modes else 'in-memory only'}")
 
     # Run benchmarks for different configurations
     for n in config.get("n_embeddings", [10000]):
@@ -408,6 +522,7 @@ def run_full_benchmark_suite(config: Dict = None, verbose: bool = True) -> List[
                             n_warmup=config.get("n_warmup", 10),
                             n_iterations=config.get("n_iterations", 100),
                             verbose=verbose,
+                            benchmark_memory_modes=benchmark_memory_modes,
                         )
                         all_results.append(results)
                     except Exception as e:
@@ -421,113 +536,197 @@ def run_full_benchmark_suite(config: Dict = None, verbose: bool = True) -> List[
 def print_summary_table(results: List[Dict]) -> None:
     """Print a detailed summary matrix of all benchmark results."""
 
+    # Check if we have memory mode results
+    has_memory_modes = any(
+        "boltembedding_filebased" in r.get("setup", {}) for r in results
+    )
+
     # ==========================================================================
     # Setup Times Table
     # ==========================================================================
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 130)
     print(" SETUP / INDEX BUILD TIME")
-    print("=" * 100)
+    print("=" * 130)
 
-    setup_header = (
-        f"{'N':>10} | {'D':>5} | {'k':>4} | "
-        f"{'Bolt':>14} | {'FAISS':>14} | {'sklearn':>14} | "
-        f"{'vs FAISS':>10} | {'vs sklearn':>10}"
-    )
+    if has_memory_modes:
+        setup_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | "
+            f"{'Bolt (mem)':>14} | {'Bolt (file)':>14} | {'FAISS':>14} | {'sklearn':>14} | "
+            f"{'mem vs file':>12}"
+        )
+    else:
+        setup_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | "
+            f"{'Bolt':>14} | {'FAISS':>14} | {'sklearn':>14} | "
+            f"{'vs FAISS':>10} | {'vs sklearn':>10}"
+        )
     print(setup_header)
-    print("-" * 100)
+    print("-" * 130)
 
     for r in results:
         cfg = r["config"]
-        bolt_setup = r["setup"].get("boltembedding", 0)
+        bolt_setup_mem = r["setup"].get("boltembedding_inmemory", 0)
+        bolt_setup_file = r["setup"].get("boltembedding_filebased", 0)
         faiss_setup = r["setup"].get("faiss", 0)
         sklearn_setup = r["setup"].get("sklearn", 0)
 
-        vs_faiss = faiss_setup / bolt_setup if bolt_setup > 0 and faiss_setup > 0 else 0
-        vs_sklearn = (
-            sklearn_setup / bolt_setup if bolt_setup > 0 and sklearn_setup > 0 else 0
-        )
-
-        print(
-            f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
-            f"{format_time(bolt_setup):>14} | {format_time(faiss_setup) if faiss_setup else 'N/A':>14} | "
-            f"{format_time(sklearn_setup) if sklearn_setup else 'N/A':>14} | "
-            f"{vs_faiss:>9.2f}x | {vs_sklearn:>9.2f}x"
-        )
+        if has_memory_modes:
+            mem_vs_file = bolt_setup_file / bolt_setup_mem if bolt_setup_mem > 0 and bolt_setup_file > 0 else 0
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
+                f"{format_time(bolt_setup_mem):>14} | {format_time(bolt_setup_file) if bolt_setup_file else 'N/A':>14} | "
+                f"{format_time(faiss_setup) if faiss_setup else 'N/A':>14} | "
+                f"{format_time(sklearn_setup) if sklearn_setup else 'N/A':>14} | "
+                f"{mem_vs_file:>11.2f}x"
+            )
+        else:
+            vs_faiss = faiss_setup / bolt_setup_mem if bolt_setup_mem > 0 and faiss_setup > 0 else 0
+            vs_sklearn = sklearn_setup / bolt_setup_mem if bolt_setup_mem > 0 and sklearn_setup > 0 else 0
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
+                f"{format_time(bolt_setup_mem):>14} | {format_time(faiss_setup) if faiss_setup else 'N/A':>14} | "
+                f"{format_time(sklearn_setup) if sklearn_setup else 'N/A':>14} | "
+                f"{vs_faiss:>9.2f}x | {vs_sklearn:>9.2f}x"
+            )
 
     # ==========================================================================
     # Single Query Latency Table
     # ==========================================================================
-    print("\n" + "=" * 120)
-    print(" SINGLE QUERY LATENCY (mean ± std)")
-    print("=" * 120)
+    print("\n" + "=" * 150)
+    print(" SINGLE QUERY LATENCY (mean)")
+    print("=" * 150)
 
-    single_header = (
-        f"{'N':>10} | {'D':>5} | {'k':>4} | "
-        f"{'Bolt':>18} | {'FAISS':>18} | {'sklearn':>18} | "
-        f"{'vs FAISS':>10} | {'vs sklearn':>10}"
-    )
+    if has_memory_modes:
+        single_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | "
+            f"{'Bolt (mem)':>14} | {'Bolt (file)':>14} | {'FAISS':>14} | {'sklearn':>14} | "
+            f"{'mem vs file':>12} | {'vs FAISS':>10}"
+        )
+    else:
+        single_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | "
+            f"{'Bolt':>18} | {'FAISS':>18} | {'sklearn':>18} | "
+            f"{'vs FAISS':>10} | {'vs sklearn':>10}"
+        )
     print(single_header)
-    print("-" * 120)
+    print("-" * 150)
 
     for r in results:
         cfg = r["config"]
-        bolt_mean, bolt_std = r["single_query"].get("boltembedding", (0, 0))
-        faiss_mean, faiss_std = r["single_query"].get("faiss", (0, 0))
-        sklearn_mean, sklearn_std = r["single_query"].get("sklearn", (0, 0))
+        bolt_mem, _ = r["single_query"].get("boltembedding_inmemory", (0, 0))
+        bolt_file, _ = r["single_query"].get("boltembedding_filebased", (0, 0))
+        faiss_mean, _ = r["single_query"].get("faiss", (0, 0))
+        sklearn_mean, _ = r["single_query"].get("sklearn", (0, 0))
 
-        vs_faiss = faiss_mean / bolt_mean if bolt_mean > 0 and faiss_mean > 0 else 0
-        vs_sklearn = (
-            sklearn_mean / bolt_mean if bolt_mean > 0 and sklearn_mean > 0 else 0
-        )
-
-        bolt_str = f"{format_time(bolt_mean)}"
-        faiss_str = f"{format_time(faiss_mean)}" if faiss_mean else "N/A"
-        sklearn_str = f"{format_time(sklearn_mean)}" if sklearn_mean else "N/A"
-
-        print(
-            f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
-            f"{bolt_str:>18} | {faiss_str:>18} | {sklearn_str:>18} | "
-            f"{vs_faiss:>9.2f}x | {vs_sklearn:>9.2f}x"
-        )
+        if has_memory_modes:
+            mem_vs_file = bolt_file / bolt_mem if bolt_mem > 0 and bolt_file > 0 else 0
+            vs_faiss = faiss_mean / bolt_mem if bolt_mem > 0 and faiss_mean > 0 else 0
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
+                f"{format_time(bolt_mem):>14} | {format_time(bolt_file) if bolt_file else 'N/A':>14} | "
+                f"{format_time(faiss_mean) if faiss_mean else 'N/A':>14} | "
+                f"{format_time(sklearn_mean) if sklearn_mean else 'N/A':>14} | "
+                f"{mem_vs_file:>11.2f}x | {vs_faiss:>9.2f}x"
+            )
+        else:
+            vs_faiss = faiss_mean / bolt_mem if bolt_mem > 0 and faiss_mean > 0 else 0
+            vs_sklearn = sklearn_mean / bolt_mem if bolt_mem > 0 and sklearn_mean > 0 else 0
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
+                f"{format_time(bolt_mem):>18} | {format_time(faiss_mean) if faiss_mean else 'N/A':>18} | "
+                f"{format_time(sklearn_mean) if sklearn_mean else 'N/A':>18} | "
+                f"{vs_faiss:>9.2f}x | {vs_sklearn:>9.2f}x"
+            )
 
     # ==========================================================================
     # Batch Query Latency Table
     # ==========================================================================
-    print("\n" + "=" * 140)
+    print("\n" + "=" * 160)
     print(" BATCH QUERY PERFORMANCE (total time | per-query latency | throughput)")
-    print("=" * 140)
+    print("=" * 160)
 
-    batch_header = (
-        f"{'N':>10} | {'D':>5} | {'k':>4} | {'Batch':>5} | "
-        f"{'Bolt Total':>12} | {'Bolt/q':>10} | {'Bolt QPS':>12} | "
-        f"{'FAISS Total':>12} | {'FAISS/q':>10} | "
-        f"{'Speedup':>8}"
-    )
+    if has_memory_modes:
+        batch_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | {'Batch':>5} | "
+            f"{'Bolt mem':>12} | {'Bolt file':>12} | {'FAISS':>12} | "
+            f"{'mem QPS':>10} | {'file QPS':>10} | {'mem/file':>9}"
+        )
+    else:
+        batch_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | {'Batch':>5} | "
+            f"{'Bolt Total':>12} | {'Bolt/q':>10} | {'Bolt QPS':>12} | "
+            f"{'FAISS Total':>12} | {'FAISS/q':>10} | "
+            f"{'Speedup':>8}"
+        )
     print(batch_header)
-    print("-" * 140)
+    print("-" * 160)
 
     for r in results:
         cfg = r["config"]
         batch_size = cfg["batch_size"]
 
-        bolt_mean, _ = r["batch_query"].get("boltembedding", (0, 0))
+        bolt_mem, _ = r["batch_query"].get("boltembedding_inmemory", (0, 0))
+        bolt_file, _ = r["batch_query"].get("boltembedding_filebased", (0, 0))
         faiss_mean, _ = r["batch_query"].get("faiss", (0, 0))
 
-        bolt_per_q = bolt_mean / batch_size if batch_size > 0 else 0
-        faiss_per_q = faiss_mean / batch_size if batch_size > 0 else 0
+        bolt_mem_qps = 1e9 * batch_size / bolt_mem if bolt_mem > 0 else 0
+        bolt_file_qps = 1e9 * batch_size / bolt_file if bolt_file > 0 else 0
 
-        # Queries per second (QPS)
-        bolt_qps = 1e9 * batch_size / bolt_mean if bolt_mean > 0 else 0
+        if has_memory_modes:
+            mem_vs_file = bolt_file / bolt_mem if bolt_mem > 0 and bolt_file > 0 else 0
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | {batch_size:>5} | "
+                f"{format_time(bolt_mem):>12} | {format_time(bolt_file) if bolt_file else 'N/A':>12} | "
+                f"{format_time(faiss_mean) if faiss_mean else 'N/A':>12} | "
+                f"{bolt_mem_qps:>8,.0f}/s | {bolt_file_qps:>8,.0f}/s | "
+                f"{mem_vs_file:>8.2f}x"
+            )
+        else:
+            bolt_per_q = bolt_mem / batch_size if batch_size > 0 else 0
+            faiss_per_q = faiss_mean / batch_size if batch_size > 0 else 0
+            vs_faiss = faiss_mean / bolt_mem if bolt_mem > 0 and faiss_mean > 0 else 0
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | {batch_size:>5} | "
+                f"{format_time(bolt_mem):>12} | {format_time(bolt_per_q):>10} | {bolt_mem_qps:>10,.0f}/s | "
+                f"{format_time(faiss_mean) if faiss_mean else 'N/A':>12} | "
+                f"{format_time(faiss_per_q) if faiss_per_q else 'N/A':>10} | "
+                f"{vs_faiss:>7.2f}x"
+            )
 
-        vs_faiss = faiss_mean / bolt_mean if bolt_mean > 0 and faiss_mean > 0 else 0
+    # ==========================================================================
+    # Memory Mode Comparison Table (if applicable)
+    # ==========================================================================
+    if has_memory_modes:
+        print("\n" + "=" * 100)
+        print(" MEMORY MODE COMPARISON (file-based vs in-memory)")
+        print("=" * 100)
+        print("Note: Values > 1.0x mean file-based is slower than in-memory")
 
-        print(
-            f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | {batch_size:>5} | "
-            f"{format_time(bolt_mean):>12} | {format_time(bolt_per_q):>10} | {bolt_qps:>10,.0f}/s | "
-            f"{format_time(faiss_mean) if faiss_mean else 'N/A':>12} | "
-            f"{format_time(faiss_per_q) if faiss_per_q else 'N/A':>10} | "
-            f"{vs_faiss:>7.2f}x"
+        mem_header = (
+            f"{'N':>10} | {'D':>5} | {'k':>4} | "
+            f"{'Setup':>12} | {'Single Query':>14} | {'Batch Query':>14}"
         )
+        print(mem_header)
+        print("-" * 100)
+
+        for r in results:
+            cfg = r["config"]
+            
+            setup_mem = r["setup"].get("boltembedding_inmemory", 0)
+            setup_file = r["setup"].get("boltembedding_filebased", 0)
+            single_mem, _ = r["single_query"].get("boltembedding_inmemory", (0, 0))
+            single_file, _ = r["single_query"].get("boltembedding_filebased", (0, 0))
+            batch_mem, _ = r["batch_query"].get("boltembedding_inmemory", (0, 0))
+            batch_file, _ = r["batch_query"].get("boltembedding_filebased", (0, 0))
+
+            setup_ratio = setup_file / setup_mem if setup_mem > 0 and setup_file > 0 else 0
+            single_ratio = single_file / single_mem if single_mem > 0 and single_file > 0 else 0
+            batch_ratio = batch_file / batch_mem if batch_mem > 0 and batch_file > 0 else 0
+
+            print(
+                f"{cfg['n_embeddings']:>10,} | {cfg['embedding_dim']:>5} | {cfg['k']:>4} | "
+                f"{setup_ratio:>11.2f}x | {single_ratio:>13.2f}x | {batch_ratio:>13.2f}x"
+            )
 
     # ==========================================================================
     # Aggregate Statistics
@@ -541,12 +740,13 @@ def print_summary_table(results: List[Dict]) -> None:
         single_speedups_faiss = []
         single_speedups_sklearn = []
         batch_speedups_faiss = []
+        memory_mode_ratios = []
 
         for r in results:
-            bolt_single = r["single_query"].get("boltembedding", (0, 0))[0]
+            bolt_single = r["single_query"].get("boltembedding_inmemory", (0, 0))[0]
             faiss_single = r["single_query"].get("faiss", (0, 0))[0]
             sklearn_single = r["single_query"].get("sklearn", (0, 0))[0]
-            bolt_batch = r["batch_query"].get("boltembedding", (0, 0))[0]
+            bolt_batch = r["batch_query"].get("boltembedding_inmemory", (0, 0))[0]
             faiss_batch = r["batch_query"].get("faiss", (0, 0))[0]
 
             if bolt_single > 0 and faiss_single > 0:
@@ -556,7 +756,13 @@ def print_summary_table(results: List[Dict]) -> None:
             if bolt_batch > 0 and faiss_batch > 0:
                 batch_speedups_faiss.append(faiss_batch / bolt_batch)
 
-        print(f"\nSpeedup vs FAISS (single query):")
+            # Memory mode comparison
+            if has_memory_modes:
+                bolt_single_file = r["single_query"].get("boltembedding_filebased", (0, 0))[0]
+                if bolt_single > 0 and bolt_single_file > 0:
+                    memory_mode_ratios.append(bolt_single_file / bolt_single)
+
+        print(f"\nSpeedup vs FAISS (single query, in-memory):")
         if single_speedups_faiss:
             print(
                 f"  Min: {min(single_speedups_faiss):.2f}x | "
@@ -567,7 +773,7 @@ def print_summary_table(results: List[Dict]) -> None:
         else:
             print("  N/A (FAISS not available)")
 
-        print(f"\nSpeedup vs scikit-learn (single query):")
+        print(f"\nSpeedup vs scikit-learn (single query, in-memory):")
         if single_speedups_sklearn:
             print(
                 f"  Min: {min(single_speedups_sklearn):.2f}x | "
@@ -578,7 +784,7 @@ def print_summary_table(results: List[Dict]) -> None:
         else:
             print("  N/A (scikit-learn not available)")
 
-        print(f"\nSpeedup vs FAISS (batch query):")
+        print(f"\nSpeedup vs FAISS (batch query, in-memory):")
         if batch_speedups_faiss:
             print(
                 f"  Min: {min(batch_speedups_faiss):.2f}x | "
@@ -588,6 +794,15 @@ def print_summary_table(results: List[Dict]) -> None:
             )
         else:
             print("  N/A (FAISS not available)")
+
+        if has_memory_modes and memory_mode_ratios:
+            print(f"\nMemory mode comparison (file-based / in-memory, single query):")
+            print(
+                f"  Min: {min(memory_mode_ratios):.2f}x | "
+                f"Max: {max(memory_mode_ratios):.2f}x | "
+                f"Avg: {np.mean(memory_mode_ratios):.2f}x | "
+                f"Median: {np.median(memory_mode_ratios):.2f}x"
+            )
 
 
 # =============================================================================
@@ -635,6 +850,11 @@ def main():
     parser.add_argument(
         "--quiet", "-q", action="store_true", help="Only print summary table"
     )
+    parser.add_argument(
+        "--no-memory-modes",
+        action="store_true",
+        help="Skip file-based memory mode benchmarks (only test in-memory)",
+    )
 
     args = parser.parse_args()
 
@@ -647,7 +867,11 @@ def main():
         "n_iterations": args.n_iterations,
     }
 
-    results = run_full_benchmark_suite(config, verbose=not args.quiet)
+    results = run_full_benchmark_suite(
+        config,
+        verbose=not args.quiet,
+        benchmark_memory_modes=not args.no_memory_modes,
+    )
 
     if len(results) > 1:
         print_summary_table(results)
